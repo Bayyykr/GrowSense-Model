@@ -10,6 +10,45 @@ CORS(app)  # Memungkinkan CORS untuk akses dari frontend/mobile app
 # Path ke file model joblib
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "sigap_model_rf.joblib")
 
+def patch_sklearn_compat(obj):
+    """
+    Memperbaiki ketidakcocokan versi scikit-learn ketika model di-pickle pada versi lama/berbeda
+    (misal: SimpleImputer yang belum memiliki atribut '_fill_dtype' atau '_fit_dtype').
+    """
+    if obj is None:
+        return
+
+    # Jika objek adalah SimpleImputer, lengkapi atribut yang hilang
+    if type(obj).__name__ == "SimpleImputer":
+        fit_dtype = getattr(obj, "_fit_dtype", None)
+        stats = getattr(obj, "statistics_", None)
+        stats_dtype = getattr(stats, "dtype", None)
+        chosen_dtype = fit_dtype if fit_dtype is not None else stats_dtype
+        
+        if not hasattr(obj, "_fill_dtype") and chosen_dtype is not None:
+            obj._fill_dtype = chosen_dtype
+        if not hasattr(obj, "_fit_dtype") and chosen_dtype is not None:
+            obj._fit_dtype = chosen_dtype
+
+    # Rekursif untuk ColumnTransformer
+    if hasattr(obj, "transformers_"):
+        for trans_entry in obj.transformers_:
+            if len(trans_entry) >= 2:
+                patch_sklearn_compat(trans_entry[1])
+
+    if hasattr(obj, "transformers"):
+        for trans_entry in obj.transformers:
+            if isinstance(trans_entry, (list, tuple)) and len(trans_entry) >= 2:
+                patch_sklearn_compat(trans_entry[1])
+
+    # Rekursif untuk Pipeline
+    if hasattr(obj, "named_steps"):
+        for _, step in obj.named_steps.items():
+            patch_sklearn_compat(step)
+    elif hasattr(obj, "steps"):
+        for _, step in obj.steps:
+            patch_sklearn_compat(step)
+
 # Load model saat aplikasi dimulai
 try:
     saved_data = joblib.load(MODEL_PATH)
@@ -25,6 +64,9 @@ try:
         ALERT_THRESHOLD = 0.5
         TARGET_NAME = "stunting"
         MODEL_NAME = type(model).__name__
+
+    # Terapkan patch kompatibilitas ke model/pipeline
+    patch_sklearn_compat(model)
 
     print(f"Model berhasil dimuat: {MODEL_NAME}")
     print(f"Fitur yang diharapkan: {FEATURE_NAMES}")
