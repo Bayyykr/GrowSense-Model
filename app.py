@@ -1,8 +1,41 @@
 import os
 import joblib
+import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from sklearn.impute import SimpleImputer
+
+# ==============================================================================
+# MONKEYPATCH: Kompatibilitas antar-versi scikit-learn
+# Memastikan semua instance SimpleImputer selalu memiliki _fill_dtype dan _fit_dtype
+# ==============================================================================
+def _safe_get_fill_dtype(self):
+    if "_fill_dtype" in self.__dict__:
+        return self.__dict__["_fill_dtype"]
+    if "_fit_dtype" in self.__dict__:
+        return self.__dict__["_fit_dtype"]
+    if hasattr(self, "statistics_") and hasattr(self.statistics_, "dtype"):
+        return self.statistics_.dtype
+    return np.dtype("float64")
+
+def _safe_set_fill_dtype(self, val):
+    self.__dict__["_fill_dtype"] = val
+
+def _safe_get_fit_dtype(self):
+    if "_fit_dtype" in self.__dict__:
+        return self.__dict__["_fit_dtype"]
+    if "_fill_dtype" in self.__dict__:
+        return self.__dict__["_fill_dtype"]
+    if hasattr(self, "statistics_") and hasattr(self.statistics_, "dtype"):
+        return self.statistics_.dtype
+    return np.dtype("float64")
+
+def _safe_set_fit_dtype(self, val):
+    self.__dict__["_fit_dtype"] = val
+
+SimpleImputer._fill_dtype = property(_safe_get_fill_dtype, _safe_set_fill_dtype)
+SimpleImputer._fit_dtype = property(_safe_get_fit_dtype, _safe_set_fit_dtype)
 
 app = Flask(__name__)
 CORS(app)  # Memungkinkan CORS untuk akses dari frontend/mobile app
@@ -12,23 +45,21 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "sigap_model_rf.joblib")
 
 def patch_sklearn_compat(obj):
     """
-    Memperbaiki ketidakcocokan versi scikit-learn ketika model di-pickle pada versi lama/berbeda
-    (misal: SimpleImputer yang belum memiliki atribut '_fill_dtype' atau '_fit_dtype').
+    Memperbaiki ketidakcocokan versi scikit-learn ketika model di-pickle pada versi lama/berbeda.
+    Menyisir seluruh atribut, transformers_, _transformers, dan named_transformers_.
     """
     if obj is None:
         return
 
-    # Jika objek adalah SimpleImputer, lengkapi atribut yang hilang
+    # Jika objek adalah SimpleImputer, lengkapi atribut di __dict__
     if type(obj).__name__ == "SimpleImputer":
         fit_dtype = getattr(obj, "_fit_dtype", None)
         stats = getattr(obj, "statistics_", None)
         stats_dtype = getattr(stats, "dtype", None)
-        chosen_dtype = fit_dtype if fit_dtype is not None else stats_dtype
+        chosen_dtype = fit_dtype if fit_dtype is not None else (stats_dtype if stats_dtype is not None else np.dtype("float64"))
         
-        if not hasattr(obj, "_fill_dtype") and chosen_dtype is not None:
-            obj._fill_dtype = chosen_dtype
-        if not hasattr(obj, "_fit_dtype") and chosen_dtype is not None:
-            obj._fit_dtype = chosen_dtype
+        obj.__dict__["_fill_dtype"] = chosen_dtype
+        obj.__dict__["_fit_dtype"] = chosen_dtype
 
     # Rekursif untuk ColumnTransformer
     if hasattr(obj, "transformers_"):
@@ -36,10 +67,19 @@ def patch_sklearn_compat(obj):
             if len(trans_entry) >= 2:
                 patch_sklearn_compat(trans_entry[1])
 
+    if hasattr(obj, "_transformers"):
+        for trans_entry in obj._transformers:
+            if isinstance(trans_entry, (list, tuple)) and len(trans_entry) >= 2:
+                patch_sklearn_compat(trans_entry[1])
+
     if hasattr(obj, "transformers"):
         for trans_entry in obj.transformers:
             if isinstance(trans_entry, (list, tuple)) and len(trans_entry) >= 2:
                 patch_sklearn_compat(trans_entry[1])
+
+    if hasattr(obj, "named_transformers_"):
+        for _, trans in obj.named_transformers_.items():
+            patch_sklearn_compat(trans)
 
     # Rekursif untuk Pipeline
     if hasattr(obj, "named_steps"):
