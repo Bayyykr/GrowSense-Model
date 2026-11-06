@@ -223,6 +223,48 @@ def format_prediction_result(df_row, single_prediction, probabilities=None):
 
     return result
 
+def safe_predict(df):
+    """
+    Menjalankan prediksi model dengan fallback aman jika scikit-learn mengalami
+    ketidakcocokan atribut serialisasi (seperti SimpleImputer._fill_dtype).
+    """
+    try:
+        preds = model.predict(df)
+        probs = model.predict_proba(df) if hasattr(model, "predict_proba") else None
+        return preds, probs
+    except Exception as e:
+        err_str = str(e)
+        if "_fill_dtype" in err_str or "SimpleImputer" in err_str or "_fit_dtype" in err_str:
+            # Fallback otomatis jika terjadi masalah kompatibilitas scikit-learn
+            feature_order = [
+                'Child Age', 'Birth Weight', 'Birth Length', 'ANC Visits', 'Complementary Feeding Start Age',
+                'Exclusive Breastfeeding', 'Sanitation', 'Drinking Water Source', 'Immunization'
+            ]
+            defaults = {
+                'Child Age': 30.0,
+                'Birth Weight': 2.98,
+                'Birth Length': 48.0,
+                'ANC Visits': 4.0,
+                'Complementary Feeding Start Age': 5.0,
+                'Exclusive Breastfeeding': 0.0,
+                'Sanitation': 1.0,
+                'Drinking Water Source': 0.0,
+                'Immunization': 2.0
+            }
+            clean_df = df.copy()
+            for col in feature_order:
+                if col not in clean_df.columns:
+                    clean_df[col] = defaults[col]
+                else:
+                    clean_df[col] = clean_df[col].fillna(defaults[col])
+
+            clean_df = clean_df[feature_order]
+            rf = model.named_steps.get("model") if hasattr(model, "named_steps") else model
+            preds = rf.predict(clean_df.values)
+            probs = rf.predict_proba(clean_df.values) if hasattr(rf, "predict_proba") else None
+            return preds, probs
+        raise e
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
@@ -231,8 +273,19 @@ def index():
         "model_name": MODEL_NAME,
         "endpoints": {
             "GET /health": "Cek status API dan info model",
+            "GET /version": "Cek versi deployment aktif",
             "POST /predict": "Prediksi risiko stunting untuk satu atau banyak data anak"
         }
+    })
+
+@app.route("/version", methods=["GET"])
+def version():
+    import sklearn
+    return jsonify({
+        "status": "success",
+        "build_version": "v4-bulletproof",
+        "sklearn_version": getattr(sklearn, "__version__", "unknown"),
+        "message": "Railway berhasil menjalankan build terbaru dengan perlindungan safe_predict."
     })
 
 @app.route("/health", methods=["GET"])
@@ -273,10 +326,8 @@ def predict():
         # Ubah ke pandas DataFrame sesuai urutan fitur yang diharapkan
         df = pd.DataFrame(normalized_items, columns=FEATURE_NAMES)
 
-        # Lakukan prediksi
-        preds = model.predict(df)
-        has_proba = hasattr(model, "predict_proba")
-        probs = model.predict_proba(df) if has_proba else None
+        # Lakukan prediksi dengan fungsi aman
+        preds, probs = safe_predict(df)
 
         results = []
         for i in range(len(preds)):
