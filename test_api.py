@@ -181,7 +181,7 @@ class FlaskApiTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.data)
         self.assertIn('model_version', data)
-        self.assertEqual(data['model_version'], 'sigap-rf-v1')
+        self.assertEqual(data['model_version'], 'sigap-rf-v2')
         self.assertIn('predictions', data)
         self.assertEqual(len(data['predictions']), 2)
 

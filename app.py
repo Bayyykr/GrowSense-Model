@@ -115,7 +115,7 @@ except Exception as e:
     raise RuntimeError(f"Gagal memuat model dari {MODEL_PATH}: {e}")
 
 # Mapping alias untuk mempermudah pemanggilan (misal: snake_case, bahasa Indonesia, atau kontrak GrowSense)
-MODEL_VERSION = "sigap-rf-v1"
+MODEL_VERSION = "sigap-rf-v2"
 SEDANG_THRESHOLD = 0.25
 
 FEATURE_ALIASES = {
@@ -315,6 +315,72 @@ def extract_contract_factors(features, level):
     pushes.sort(key=lambda item: item[1], reverse=True)
     return [key for key, _ in pushes[:3]]
 
+def calibrate_contract_score(base_prob, features):
+    """
+    Mengkalibrasi probabilitas dasar dari Random Forest dengan indikator antropometri WHO
+    (haz, waz, whz, haz_change_3m, waz_change_3m) agar persentase risiko AI selaras
+    dengan tingkat keparahan klinis dan tren pertumbuhan 3 bulan terakhir.
+    """
+    score = float(base_prob)
+    if not isinstance(features, dict):
+        return max(0.0, min(1.0, round(score, 4)))
+
+    haz = features.get("haz")
+    waz = features.get("waz")
+    whz = features.get("whz")
+    haz_change = features.get("haz_change_3m")
+    waz_change = features.get("waz_change_3m")
+
+    # 1. Tren penurunan TB/U (haz_change_3m) dalam 3 bulan terakhir
+    if isinstance(haz_change, (int, float)) and haz_change < 0:
+        fall = -float(haz_change)
+        if fall >= 0.5 and isinstance(haz, (int, float)) and haz < -1.5:
+            # Penurunan cepat dan mendekati batas pendek -> zona risiko tinggi
+            score = max(score + 0.30, float(ALERT_THRESHOLD) + 0.20, 0.68 + min(0.20, (fall - 0.5) * 0.3))
+        elif fall >= 0.3:
+            # Pertumbuhan tinggi melambat -> zona sedang (kecuali jika base_prob memang sudah tinggi)
+            target_sedang = min(float(ALERT_THRESHOLD) - 0.04, max(float(SEDANG_THRESHOLD) + 0.12, 0.35 + (fall - 0.3) * 0.35))
+            score = max(score, target_sedang)
+        elif fall >= 0.15 and isinstance(haz, (int, float)) and haz < -1.0:
+            target_watch = min(float(ALERT_THRESHOLD) - 0.06, max(float(SEDANG_THRESHOLD) + 0.06, 0.32))
+            score = max(score, target_watch)
+
+    # 2. Tren penurunan BB/U (waz_change_3m)
+    if isinstance(waz_change, (int, float)) and waz_change <= -0.3:
+        w_fall = -float(waz_change)
+        score += min(0.12, (w_fall - 0.15) * 0.25)
+
+    # 3. Status antropometri saat ini (z-score WHO)
+    already_stunted = isinstance(haz, (int, float)) and haz < -2.0
+    already_wasted = isinstance(whz, (int, float)) and whz < -2.0
+    severely_underweight = isinstance(waz, (int, float)) and waz < -3.0
+
+    if already_stunted or already_wasted or severely_underweight:
+        sev_haz = (-2.0 - float(haz)) if already_stunted else 0.0
+        sev_whz = (-2.0 - float(whz)) if already_wasted else 0.0
+        sev_waz = (-3.0 - float(waz)) if severely_underweight else 0.0
+        severity = max(sev_haz, sev_whz, sev_waz)
+        high_floor = min(0.95, max(float(ALERT_THRESHOLD) + 0.22, 0.70) + severity * 0.15)
+        score = max(score + 0.35, high_floor)
+    else:
+        if isinstance(haz, (int, float)) and haz < -1.5:
+            score += (-1.5 - float(haz)) * 0.20
+        if isinstance(whz, (int, float)) and -2.0 <= whz < -1.0:
+            score = max(score + (-1.0 - float(whz)) * 0.10, float(SEDANG_THRESHOLD) + 0.05)
+        if isinstance(waz, (int, float)) and -3.0 <= waz < -1.5:
+            score += (-1.5 - float(waz)) * 0.08
+
+        # Jika pertumbuhan sangat baik (z-score >= -0.5 dan tidak turun), redam noise imputasi
+        if (
+            isinstance(haz, (int, float)) and haz >= -0.5
+            and (waz is None or (isinstance(waz, (int, float)) and waz >= -0.5))
+            and (whz is None or (isinstance(whz, (int, float)) and whz >= -0.5))
+            and (haz_change is None or (isinstance(haz_change, (int, float)) and haz_change >= -0.15))
+        ):
+            score = min(score, float(SEDANG_THRESHOLD) - 0.07)
+
+    return max(0.01, min(0.99, round(score, 4)))
+
 def format_prediction_result(df_row, single_prediction, probabilities=None):
     prob_stunting = None
     if probabilities is not None and len(probabilities) > 1:
@@ -472,7 +538,8 @@ def predict():
                 else:
                     prob_stunting = float(preds[i])
 
-                score = max(0.0, min(1.0, round(prob_stunting, 4)))
+                features_dict = inst.get("features") if isinstance(inst.get("features"), dict) else {}
+                score = calibrate_contract_score(prob_stunting, features_dict)
                 if score >= ALERT_THRESHOLD:
                     level = "tinggi"
                 elif score >= SEDANG_THRESHOLD:
@@ -480,7 +547,7 @@ def predict():
                 else:
                     level = "rendah"
 
-                factors = extract_contract_factors(inst.get("features") or {}, level)
+                factors = extract_contract_factors(features_dict, level)
                 predictions.append({
                     "id": str(inst["id"]),
                     "score": score,
