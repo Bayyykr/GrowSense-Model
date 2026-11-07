@@ -114,21 +114,29 @@ try:
 except Exception as e:
     raise RuntimeError(f"Gagal memuat model dari {MODEL_PATH}: {e}")
 
-# Mapping alias untuk mempermudah pemanggilan (misal: snake_case atau bahasa Indonesia)
+# Mapping alias untuk mempermudah pemanggilan (misal: snake_case, bahasa Indonesia, atau kontrak GrowSense)
+MODEL_VERSION = "sigap-rf-v1"
+SEDANG_THRESHOLD = 0.25
+
 FEATURE_ALIASES = {
     # Child Age
     "child_age": "Child Age",
     "childage": "Child Age",
     "usia_anak": "Child Age",
     "umur_anak": "Child Age",
+    "age_months": "Child Age",
+    "agemonths": "Child Age",
     # Birth Weight
     "birth_weight": "Birth Weight",
     "birthweight": "Birth Weight",
     "berat_lahir": "Birth Weight",
+    "birth_weight_kg": "Birth Weight",
+    "birthweightkg": "Birth Weight",
     # Birth Length
     "birth_length": "Birth Length",
     "birthlength": "Birth Length",
     "panjang_lahir": "Birth Length",
+    "birth_length_cm": "Birth Length",
     # ANC Visits
     "anc_visits": "ANC Visits",
     "ancvisits": "ANC Visits",
@@ -145,9 +153,11 @@ FEATURE_ALIASES = {
     # Immunization
     "immunization": "Immunization",
     "imunisasi": "Immunization",
+    "imunisasi_lengkap": "Immunization",
     # Sanitation
     "sanitation": "Sanitation",
     "sanitasi": "Sanitation",
+    "sanitasi_layak": "Sanitation",
     # Drinking Water Source
     "drinking_water_source": "Drinking Water Source",
     "drinkingwatersource": "Drinking Water Source",
@@ -191,6 +201,119 @@ def normalize_input(raw_dict):
             normalized[target_feature] = None  # Imputer dalam pipeline akan menangani nilai kosong jika ada
 
     return normalized
+
+def map_contract_instance(inst):
+    """
+    Memetakan satu instance dari Kontrak AI GrowSense (docs/ai-contract.md)
+    ke fitur yang dibutuhkan oleh model Random Forest.
+    """
+    f = inst.get("features") if isinstance(inst.get("features"), dict) else {}
+    history = inst.get("history") if isinstance(inst.get("history"), list) else []
+
+    raw = dict(f)
+
+    # 1. Child Age (bulan)
+    if f.get("age_months") is not None:
+        raw["Child Age"] = f["age_months"]
+    elif history and isinstance(history[-1], dict) and history[-1].get("age_months") is not None:
+        raw["Child Age"] = history[-1]["age_months"]
+
+    # 2. Birth Weight (kg)
+    if f.get("birth_weight_kg") is not None:
+        raw["Birth Weight"] = f["birth_weight_kg"]
+
+    # 3. Birth Length (cm) - ambil dari history usia 0 bulan jika ada, selain itu di-impute oleh model
+    if "Birth Length" not in raw and "birth_length" not in raw and "panjang_lahir" not in raw:
+        for visit in history:
+            if isinstance(visit, dict) and visit.get("age_months") == 0 and visit.get("height_cm") is not None:
+                raw["Birth Length"] = visit["height_cm"]
+                break
+
+    # 4. Exclusive Breastfeeding (0 / 1)
+    if "asi_eksklusif" in f:
+        if isinstance(f["asi_eksklusif"], bool):
+            raw["Exclusive Breastfeeding"] = 1.0 if f["asi_eksklusif"] else 0.0
+        elif f["asi_eksklusif"] is None:
+            raw.pop("asi_eksklusif", None)
+
+    # 5. Complementary Feeding Start Age (bulan)
+    if "mpasi_adekuat" in f and "Complementary Feeding Start Age" not in raw and "mpasi_start_age" not in raw:
+        if f["mpasi_adekuat"] is True:
+            raw["Complementary Feeding Start Age"] = 6.0
+        elif f["mpasi_adekuat"] is False:
+            raw["Complementary Feeding Start Age"] = 4.0
+
+    # 6. Immunization (0 = belum, 1 = sebagian, 2 = lengkap)
+    if "imunisasi_lengkap" in f:
+        if isinstance(f["imunisasi_lengkap"], bool):
+            raw["Immunization"] = 2.0 if f["imunisasi_lengkap"] else 0.0
+        elif f["imunisasi_lengkap"] is None:
+            raw.pop("imunisasi_lengkap", None)
+
+    # 7. Sanitation & Drinking Water Source (0 / 1)
+    if "sanitasi_layak" in f:
+        if isinstance(f["sanitasi_layak"], bool):
+            val_san = 1.0 if f["sanitasi_layak"] else 0.0
+            raw["Sanitation"] = val_san
+            if "Drinking Water Source" not in raw and "drinking_water_source" not in raw and "sumber_air_minum" not in raw:
+                raw["Drinking Water Source"] = val_san
+        elif f["sanitasi_layak"] is None:
+            raw.pop("sanitasi_layak", None)
+
+    return normalize_input(raw)
+
+def extract_contract_factors(features, level):
+    """
+    Menentukan maksimal 3 kunci faktor risiko terkuat sesuai kamus AI_FACTOR_LABEL
+    di GrowSense (@growsense/core) agar aplikasi menampilkan teks Bahasa Indonesia.
+    """
+    if not isinstance(features, dict):
+        return []
+
+    pushes = []
+
+    haz_change = features.get("haz_change_3m")
+    if isinstance(haz_change, (int, float)) and haz_change <= -0.3:
+        pushes.append(("haz_change_3m", abs(float(haz_change)) + 1.0))
+
+    waz_change = features.get("waz_change_3m")
+    if isinstance(waz_change, (int, float)) and waz_change <= -0.3:
+        pushes.append(("waz_change_3m", abs(float(waz_change)) + 0.8))
+
+    bw = features.get("birth_weight_kg")
+    if isinstance(bw, (int, float)) and bw < 2.5:
+        pushes.append(("birth_weight_kg", 0.9))
+
+    if features.get("sanitasi_layak") is False:
+        pushes.append(("sanitasi_layak", 0.85))
+
+    if features.get("asi_eksklusif") is False:
+        pushes.append(("asi_eksklusif", 0.8))
+
+    age = features.get("age_months")
+    if features.get("mpasi_adekuat") is False and (age is None or (isinstance(age, (int, float)) and age >= 6)):
+        pushes.append(("mpasi_adekuat", 0.75))
+
+    if features.get("imunisasi_lengkap") is False:
+        pushes.append(("imunisasi_lengkap", 0.7))
+
+    whz = features.get("whz")
+    if isinstance(whz, (int, float)) and whz < -1.0:
+        pushes.append(("whz", 0.65))
+
+    waz = features.get("waz")
+    if isinstance(waz, (int, float)) and waz < -1.0:
+        pushes.append(("waz", 0.6))
+
+    haz = features.get("haz")
+    if isinstance(haz, (int, float)) and haz < -1.0:
+        pushes.append(("haz", 0.55))
+
+    if level != "rendah" and isinstance(age, (int, float)) and 6 <= age <= 24:
+        pushes.append(("age_months", 0.4))
+
+    pushes.sort(key=lambda item: item[1], reverse=True)
+    return [key for key, _ in pushes[:3]]
 
 def format_prediction_result(df_row, single_prediction, probabilities=None):
     prob_stunting = None
@@ -294,22 +417,83 @@ def health():
         "status": "healthy",
         "model_loaded": model is not None,
         "model_name": MODEL_NAME,
+        "model_version": MODEL_VERSION,
+        "contract_supported": 1,
         "target": TARGET_NAME,
         "alert_threshold": ALERT_THRESHOLD,
+        "sedang_threshold": SEDANG_THRESHOLD,
         "required_features": FEATURE_NAMES
     })
 
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
-        data = request.get_json()
-        if not data:
+        data = request.get_json(silent=True)
+        if data is None or data == {} or data == []:
             return jsonify({
                 "status": "error",
                 "message": "Request body harus berupa JSON"
             }), 400
 
-        # Dukung single object maupun list (batch)
+        # Mode 1: Kontrak AI GrowSense (docs/ai-contract.md)
+        if isinstance(data, dict) and ("contract" in data or "instances" in data):
+            if data.get("contract") != 1 or not isinstance(data.get("instances"), list):
+                return jsonify({
+                    "status": "error",
+                    "message": "Format kontrak AI tidak valid (wajib contract: 1 dan instances berupa array)"
+                }), 400
+
+            instances = data["instances"]
+            if len(instances) == 0:
+                return jsonify({
+                    "model_version": MODEL_VERSION,
+                    "predictions": []
+                }), 200
+
+            normalized_items = []
+            for i, inst in enumerate(instances):
+                if not isinstance(inst, dict) or not inst.get("id"):
+                    return jsonify({
+                        "status": "error",
+                        "message": f"Instance pada indeks {i} wajib berupa object dan memiliki 'id'"
+                    }), 400
+                normalized_items.append(map_contract_instance(inst))
+
+            df = pd.DataFrame(normalized_items, columns=FEATURE_NAMES)
+            preds, probs = safe_predict(df)
+
+            predictions = []
+            for i, inst in enumerate(instances):
+                row_prob = probs[i] if probs is not None else None
+                if row_prob is not None and len(row_prob) > 1:
+                    prob_stunting = float(row_prob[1])
+                elif row_prob is not None and len(row_prob) == 1:
+                    prob_stunting = float(row_prob[0])
+                else:
+                    prob_stunting = float(preds[i])
+
+                score = max(0.0, min(1.0, round(prob_stunting, 4)))
+                if score >= ALERT_THRESHOLD:
+                    level = "tinggi"
+                elif score >= SEDANG_THRESHOLD:
+                    level = "sedang"
+                else:
+                    level = "rendah"
+
+                factors = extract_contract_factors(inst.get("features") or {}, level)
+                predictions.append({
+                    "id": str(inst["id"]),
+                    "score": score,
+                    "level": level,
+                    "factors": factors
+                })
+
+            return jsonify({
+                "model_version": MODEL_VERSION,
+                "predictions": predictions
+            }), 200
+
+        # Mode 2: Format langsung (single object maupun list/batch)
         is_batch = isinstance(data, list)
         items = data if is_batch else [data]
 

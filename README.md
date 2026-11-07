@@ -197,3 +197,61 @@ Endpoint `/predict` secara otomatis mendukung payload berupa `array/list` objek 
   ]
 }
 ```
+
+---
+
+### 4. Integrasi Langsung Aplikasi GrowSense (Kontrak AI v1)
+Endpoint `POST /predict` secara otomatis mendeteksi request dari aplikasi **GrowSense PWA Kader** maupun **Dashboard Web Bidan** (`contract: 1`) sesuai spesifikasi `docs/ai-contract.md`.
+
+Cukup arahkan variabel environment `VITE_AI_URL` pada aplikasi GrowSense ke endpoint `/predict`:
+```env
+VITE_AI_URL=https://url-hosting-api-anda.up.railway.app/predict
+```
+
+#### Contoh Request Body (Kontrak GrowSense):
+```json
+{
+  "contract": 1,
+  "instances": [
+    {
+      "id": "visit-risiko-002",
+      "features": {
+        "sex": "female",
+        "age_months": 14,
+        "haz": -1.31,
+        "waz": -1.05,
+        "whz": -0.42,
+        "haz_change_3m": -0.46,
+        "waz_change_3m": -0.38,
+        "months_between": 3,
+        "visits": 7,
+        "birth_weight_kg": 2.1,
+        "asi_eksklusif": false,
+        "mpasi_adekuat": false,
+        "imunisasi_lengkap": false,
+        "sanitasi_layak": false
+      },
+      "history": []
+    }
+  ]
+}
+```
+
+#### Contoh Response (Kontrak GrowSense):
+```json
+{
+  "model_version": "sigap-rf-v1",
+  "predictions": [
+    {
+      "id": "visit-risiko-002",
+      "score": 0.8148,
+      "level": "tinggi",
+      "factors": [
+        "haz_change_3m",
+        "waz_change_3m",
+        "birth_weight_kg"
+      ]
+    }
+  ]
+}
+```
